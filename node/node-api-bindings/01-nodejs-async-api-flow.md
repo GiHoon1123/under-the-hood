@@ -204,7 +204,71 @@ libuv C 이벤트 루프
 
 파일 읽기 작업 자체는 libuv 스레드풀이나 운영체제를 통해 먼저 끝날 수 있다. 그러나 Node의 메인 흐름이 완료 결과를 처리하고 JavaScript 콜백을 실행하려면 이벤트 루프가 해당 결과를 처리해야 한다.
 
-## 6. libuv 완료 콜백과 JavaScript 콜백
+## 6.1 libuv가 운영체제를 호출하고 완료를 돌려주는 경로
+
+파일: deps/uv/include/uv.h
+
+uv_fs_read()는 libuv가 제공하는 파일 읽기 API다. Node C++는 이 함수에 이벤트 루프, uv_fs_t 요청 구조체, 파일 디스크립터, 버퍼, offset, 완료 콜백을 전달한다.
+
+~~~text
+uv_fs_read()
+  ├─ loop: 어느 이벤트 루프에 등록할지
+  ├─ req: 파일 작업 상태
+  ├─ file: 파일 디스크립터
+  ├─ bufs: 결과를 저장할 메모리
+  ├─ offset: 읽기 시작 위치
+  └─ cb: 작업 완료 콜백
+~~~
+
+Unix 구현은 deps/uv/src/unix/fs.c에 있다. uv_fs_read()는 요청을 초기화하고 비동기 콜백이 있으면 uv__work_submit()을 통해 작업을 제출한다.
+
+~~~text
+deps/uv/src/unix/fs.c
+  ↓
+uv_fs_read()
+  ↓
+uv__work_submit()
+  ↓
+uv__fs_work()
+~~~
+
+uv__fs_work()는 요청의 fs_type을 보고 실제 작업 함수를 선택한다. 읽기 요청이면 uv__fs_read()가 호출된다.
+
+~~~text
+uv__fs_work()
+  ↓
+UV_FS_READ 확인
+  ↓
+uv__fs_read()
+  ↓
+read() 또는 pread()
+  ↓
+운영체제 파일 시스템
+~~~
+
+읽기 위치가 음수이면 현재 파일 위치를 사용하는 read() 계열 경로를 타고, 명시적인 offset이 있으면 pread() 계열 경로를 사용할 수 있다. 이 함수들은 JavaScript 함수가 아니라 Unix 운영체제가 제공하는 시스템 호출이다.
+
+작업이 끝난 뒤에는 deps/uv/src/threadpool.c의 uv__work_done()이 완료 큐를 처리한다.
+
+~~~text
+파일 작업 완료
+  ↓
+완료 큐에 결과 등록
+  ↓
+uv_run()이 이벤트 루프에서 완료 이벤트 처리
+  ↓
+uv__work_done()
+  ↓
+w->done(w, status)
+  ↓
+uv__fs_done()
+  ↓
+req->cb(req)
+~~~
+
+파일 작업에서 req->cb는 Node C++가 AsyncCall()에 넘긴 AfterInteger(), AfterStat() 같은 완료 함수다. 이 지점까지가 libuv가 작업을 끝내고 Node C++로 결과를 돌려주는 과정이다.
+
+## 6.2 libuv 완료 콜백과 JavaScript 콜백
 
 ~~~text
 파일 읽기 완료
@@ -227,6 +291,65 @@ V8 MakeCallback 계열 호출
 ~~~
 
 uv_run()이 JavaScript 콜백을 직접 호출하는 것이 아니다. libuv가 Node C++ 콜백을 부르고 Node C++가 V8을 호출한다.
+
+## 6.3 Promise 결과가 V8 마이크로태스크로 이어지는 경로
+
+콜백 방식과 Promise 방식은 libuv 완료 지점까지는 비슷하지만, Node C++가 결과를 전달하는 방식이 다르다.
+
+~~~text
+콜백 방식
+  → FSReqCallback::Resolve()
+  → MakeCallback()
+  → JavaScript callback
+
+Promise 방식
+  → FSReqPromise::Resolve()
+  → v8::Promise::Resolver::Resolve()
+  → Promise fulfilled
+  → V8 Promise reaction 예약
+~~~
+
+Promise 요청 클래스의 선언은 src/node_file.h에 있고, 템플릿 구현은 src/node_file-inl.h에 있다.
+
+src/node_file-inl.h의 FSReqPromise::Resolve()는 요청 객체 안에 보관해 둔 v8::Promise::Resolver를 가져와 Resolver::Resolve()를 호출한다.
+
+~~~text
+AfterInteger()
+  ↓
+FSReqPromise::Resolve()
+  ↓
+v8::Promise::Resolver::Resolve()
+  ↓
+Promise fulfilled
+  ↓
+then 또는 await continuation 예약
+~~~
+
+Node C++가 직접 마이크로태스크 큐에 await 코드를 넣는 것은 아니다. Promise Resolver를 호출하면 V8이 Promise에 연결된 후속 작업을 Promise reaction으로 예약한다.
+
+FSReqPromise::Resolve() 안에는 InternalCallbackScope도 있다. 이 scope가 닫힐 때 src/api/callback.cc의 InternalCallbackScope::Close()가 실행되고, 조건이 맞으면 다음 코드를 호출한다.
+
+~~~cpp
+context->GetMicrotaskQueue()->PerformCheckpoint(isolate);
+~~~
+
+이 호출이 V8 마이크로태스크 큐에 등록된 Promise 후속 작업을 실제로 실행하는 지점이다.
+
+~~~text
+FSReqPromise::Resolve()
+  ↓
+V8 Resolver::Resolve()
+  ↓
+V8이 continuation을 마이크로태스크로 예약
+  ↓
+InternalCallbackScope::Close()
+  ↓
+PerformCheckpoint()
+  ↓
+await 이후 JavaScript 실행
+~~~
+
+다만 Node는 마이크로태스크만 처리하는 것이 아니다. InternalCallbackScope::Close()는 tick이 예약되어 있는지도 확인하고, Node의 nextTick 처리와 V8 마이크로태스크 처리를 조정한다. 실제 실행 순서는 현재 callback scope와 tick 상태에 따라 Node가 관리한다.
 
 ## 7. 콜백 안에서 새 비동기 작업을 등록하는 경우
 
