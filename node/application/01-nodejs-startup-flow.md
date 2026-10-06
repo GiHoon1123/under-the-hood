@@ -385,6 +385,58 @@ V8이 JavaScript 콜백 실행
 
 UV_RUN_DEFAULT는 이벤트 루프에 살아 있는 작업이 없어질 때까지 실행하는 모드다. UV_RUN_ONCE라면 한 번의 루프 반복 뒤 반환할 수 있지만, Node 바깥의 SpinEventLoopInternal()이 다시 uv_run()을 호출할 수 있다.
 
+### uv_run 이후 libuv가 작업을 완료하는 경로
+
+uv_run()이 실행되었다고 운영체제의 파일 함수가 바로 Node C++에서 호출되는 것은 아니다. libuv는 요청을 등록하고, 작업 종류에 맞는 내부 함수와 완료 큐를 거친다.
+
+파일 읽기 기준의 Unix 경로:
+
+~~~text
+uv_run()
+  ↓
+libuv가 완료 큐와 이벤트를 처리
+  ↓
+uv__work_done()
+  ↓
+uv__fs_done()
+  ↓
+Node가 등록한 완료 콜백
+~~~
+
+관련 파일:
+
+- deps/uv/include/uv.h: uv_fs_read() 공개 선언
+- deps/uv/src/unix/fs.c: Unix 파일 시스템 구현
+- deps/uv/src/threadpool.c: 작업 제출과 완료 큐 처리
+
+uv_fs_read()는 uv_fs_t에 파일 디스크립터, 버퍼, offset, 완료 콜백을 기록한다. 비동기 콜백이 있으면 uv__work_submit()을 통해 uv__fs_work와 uv__fs_done을 작업으로 등록한다.
+
+~~~text
+uv_fs_read()
+  ↓
+uv__work_submit()
+  ↓
+uv__fs_work()
+  ↓
+uv__fs_read()
+  ↓
+운영체제 read() 또는 pread()
+~~~
+
+작업이 끝나면 libuv는 loop의 완료 큐를 깨우고, uv_run()이 그 큐를 처리할 때 uv__work_done()을 호출한다. uv__work_done()은 완료된 작업의 done 함수를 호출하고, 파일 작업에서는 그 함수가 uv__fs_done()이다.
+
+~~~text
+uv__work_done()
+  ↓
+w->done(w, status)
+  ↓
+uv__fs_done()
+  ↓
+req->cb(req)
+~~~
+
+Node가 req->cb로 넘긴 함수는 AfterInteger(), AfterStat() 같은 Node C++ 완료 함수다. 따라서 libuv의 C 작업 완료와 Node C++의 결과 전달이 이 지점에서 연결된다.
+
 ## 8. uv_loop_alive와 종료
 
 uv_run()이 반환된 뒤 Node는 이벤트 루프에 아직 작업이 남아 있는지 확인한다. 활성 타이머, 열린 서버, 처리 중인 I/O 요청 등이 있으면 이벤트 루프는 살아 있다고 볼 수 있다.
